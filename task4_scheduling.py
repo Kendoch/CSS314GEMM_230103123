@@ -1,56 +1,102 @@
-import argparse, math, multiprocessing as mp, time
-from harness import run_benchmark, emit_verify_tag
+import multiprocessing as mp
+import math
+import time
+from harness import emit_verify_tag
 
-N=12_000
+N=8000
+
 def work_item(i):
-    k=1+(i//60)**2
-    x=0.123
-    for j in range(k):
-        x=math.sin(x+0.000001*j)+math.cos(x*0.5)+math.sqrt(abs(x)+1e-12)*0.001
+    k = 1 + int((i/40)**2)
+    x = (i+1)*0.0001
+    for _ in range(k):
+        x = math.sin(x) + math.cos(x*0.5) + math.sqrt(abs(x)+1.0)
     return x
 
-def worker_static(args):
-    mode, worker, p, n = args
+def _static_worker(indices, timings, slot, result_queue):
     t0=time.perf_counter()
-    if mode=="block":
-        lo=worker*n//p; hi=(worker+1)*n//p
-        indices=range(lo,hi)
-    else:
-        indices=range(worker,n,p)
-    acc=0.0
-    for i in indices: acc+=work_item(i)
-    return (time.perf_counter()-t0)*1000,acc
+    total=0.0
+    for i in indices:
+        total += work_item(i)
+    timings[slot]=time.perf_counter()-t0
+    result_queue.put(total)
 
-def dynamic_worker(args):
-    name, lock, counter, chunk, n = args
-    # This function is intentionally unused; dynamic queue is implemented with Pool chunks below.
-    return 0.0
+def _dynamic_worker(counter, lock, chunk, timings, slot, result_queue):
+    t0=time.perf_counter()
+    total=0.0
+    while True:
+        with lock:
+            start=counter.value
+            counter.value += chunk
+        if start>=N:
+            break
+        for i in range(start,min(start+chunk,N)):
+            total += work_item(i)
+    timings[slot]=time.perf_counter()-t0
+    result_queue.put(total)
 
-def run_static(mode,p,n):
-    with mp.Pool(p) as pool:
-        vals=pool.map(worker_static,[(mode,t,p,n) for t in range(p)])
-    times=[x[0] for x in vals]
-    return max(times), max(times)/ (sum(times)/len(times)), times
+def run_static(p, mode):
+    timings=mp.Array('d',p)
+    q=mp.Queue()
+    processes=[]
+    for w in range(p):
+        if mode=="block":
+            start=w*N//p
+            end=(w+1)*N//p
+            indices=range(start,end)
+        else:
+            indices=range(w,N,p)
+        proc=mp.Process(target=_static_worker,args=(indices,timings,w,q))
+        proc.start()
+        processes.append(proc)
+    for proc in processes:
+        proc.join()
+        if proc.exitcode != 0:
+            raise RuntimeError(f"Worker failed: {proc.exitcode}")
+    values=[q.get() for _ in processes]
+    q.close()
+    return sum(values),list(timings)
+
+def run_dynamic(p,chunk):
+    timings=mp.Array('d',p)
+    counter=mp.Value('i',0)
+    lock=mp.Lock()
+    q=mp.Queue()
+    processes=[]
+    for w in range(p):
+        proc=mp.Process(target=_dynamic_worker,args=(counter,lock,chunk,timings,w,q))
+        proc.start()
+        processes.append(proc)
+    for proc in processes:
+        proc.join()
+        if proc.exitcode != 0:
+            raise RuntimeError(f"Worker failed: {proc.exitcode}")
+    values=[q.get() for _ in processes]
+    q.close()
+    return sum(values),list(timings)
+
+def measure(fn):
+    t0=time.perf_counter()
+    value,times=fn()
+    wall=(time.perf_counter()-t0)*1000
+    avg=sum(times)/len(times) if times else 0
+    imbalance=max(times)/avg if avg else 0
+    return wall,imbalance,times,value
 
 def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument("--quick",action="store_true")
-    args=ap.parse_args()
-    p=mp.cpu_count(); n=1500 if args.quick else N
-    print("PHASE 4 — Scheduling")
-    for mode in ("block","cyclic"):
-        wall,lam,times=run_static(mode,p,n)
-        print(f"{mode}: worker_max={wall:.3f} ms lambda={lam:.3f} worker_times={[round(x,2) for x in times]}")
-    # Dynamic scheduling using multiprocessing.Pool.imap_unordered with explicit chunksize.
-    # Per-worker active times are not exposed by Pool, so lambda is reported as N/A.
-    for c in (1,4,16,64,256,1024):
-        t0=time.perf_counter()
-        with mp.Pool(p) as pool:
-            total=sum(pool.imap_unordered(work_item,range(n),chunksize=c))
-        wall=(time.perf_counter()-t0)*1000
-        print(f"dynamic chunk={c}: wall={wall:.3f} ms lambda=N/A (Pool does not expose per-process active time)")
-    print("For strict lambda telemetry, implement dedicated workers with a shared timing array.")
-    print(emit_verify_tag("PHASE4",0,0.0,0.0))
+    p=max(1,min(mp.cpu_count(),8))
+    print(f"N={N}, workers={p}")
+    block=measure(lambda:run_static(p,"block"))
+    cyclic=measure(lambda:run_static(p,"cyclic"))
+    print(f"Block static: wall={block[0]:.2f} ms, lambda={block[1]:.3f}")
+    print(f"Cyclic static: wall={cyclic[0]:.2f} ms, lambda={cyclic[1]:.3f}")
+    dynamic={}
+    for chunk in (1,8,64,512):
+        result=measure(lambda:run_dynamic(p,chunk))
+        dynamic[chunk]=result
+        print(f"Dynamic C={chunk}: wall={result[0]:.2f} ms, lambda={result[1]:.3f}")
+    best=min(dynamic,key=lambda x:dynamic[x][0])
+    print(f"Selected chunk C*={best}")
+    print(emit_verify_tag("PHASE4","REPLACE_WITH_YOUR_STUDENT_ID",block[0],dynamic[best][0]))
 
 if __name__=="__main__":
     mp.freeze_support()

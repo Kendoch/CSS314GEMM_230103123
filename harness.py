@@ -1,8 +1,11 @@
 from dataclasses import dataclass
-import hashlib
 import multiprocessing as mp
-import statistics
+import hashlib
 import time
+import statistics
+import os
+import platform
+import subprocess
 from typing import Callable
 
 @dataclass
@@ -10,34 +13,66 @@ class BenchStats:
     min_ms: float
     median_ms: float
     iqr_ms: float
-    max_ms: float
+    samples_ms: list
 
 def fnv1a_hash(s: str) -> int:
     h = 14695981039346656037
     for b in s.encode("utf-8"):
-        h ^= b
-        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
     return h
 
-def run_benchmark(fn: Callable[[], None], warmup_runs: int = 2,
-                  timed_runs: int = 7) -> BenchStats:
-    for _ in range(warmup_runs):
+def run_benchmark(fn: Callable, warmup: int = 2, runs: int = 7) -> BenchStats:
+    for _ in range(warmup):
         fn()
     samples = []
-    for _ in range(timed_runs):
+    for _ in range(runs):
         t0 = time.perf_counter_ns()
         fn()
         samples.append((time.perf_counter_ns() - t0) / 1e6)
-    samples.sort()
-    mid = len(samples) // 2
-    med = statistics.median(samples)
-    q25 = samples[len(samples) // 4]
-    q75 = samples[(3 * len(samples)) // 4]
-    return BenchStats(samples[0], med, q75 - q25, samples[-1])
+    ordered = sorted(samples)
+    q1 = ordered[len(ordered) // 4]
+    q3 = ordered[(3 * len(ordered)) // 4]
+    return BenchStats(min(ordered), statistics.median(ordered), q3 - q1, samples)
 
-def emit_verify_tag(task_id: str, student_seed: int,
-                    primary_metric: float, secondary_metric: float) -> str:
+def emit_verify_tag(phase: str, seed: str, m1: float, m2: float) -> str:
     hw = mp.cpu_count()
-    payload = (f"{task_id}|{student_seed}|{hw}|"
-               f"{primary_metric:.4f}|{secondary_metric:.4f}")
-    return f"VERIFY_HASH [{task_id}]: {fnv1a_hash(payload):016X} (P_log={hw})"
+    sig = fnv1a_hash(f"{phase}|{seed}|{hw}|{m1:.4f}|{m2:.4f}")
+    return f"VERIFY_HASH[{phase}]: {sig:016X} (P_log={hw})"
+
+def cpu_info():
+    info = {
+        "platform": platform.platform(),
+        "processor": platform.processor() or platform.machine(),
+        "physical_cores": None,
+        "logical_threads": mp.cpu_count(),
+        "cache_line_bytes": None,
+        "L1d": "unknown",
+        "L2": "unknown",
+        "L3": "unknown",
+    }
+    if platform.system() == "Darwin":
+        commands = {
+            "physical_cores": ["sysctl", "-n", "hw.physicalcpu"],
+            "logical_threads": ["sysctl", "-n", "hw.logicalcpu"],
+            "cache_line_bytes": ["sysctl", "-n", "hw.cachelinesize"],
+            "L1d": ["sysctl", "-n", "hw.l1dcachesize"],
+            "L2": ["sysctl", "-n", "hw.l2cachesize"],
+            "L3": ["sysctl", "-n", "hw.l3cachesize"],
+            "processor": ["sysctl", "-n", "machdep.cpu.brand_string"],
+        }
+        for key, cmd in commands.items():
+            try:
+                info[key] = subprocess.check_output(cmd, text=True).strip()
+            except Exception:
+                pass
+    elif platform.system() == "Linux":
+        try:
+            text = Path("/proc/cpuinfo").read_text(errors="ignore")
+            for line in text.splitlines():
+                if line.lower().startswith("model name"):
+                    info["processor"] = line.split(":", 1)[1].strip()
+                    break
+            info["physical_cores"] = os.cpu_count()
+        except Exception:
+            pass
+    return info
